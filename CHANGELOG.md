@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+### Added
+- **Credit-metered ChatGPT workspaces (Business / Edu / Enterprise on flexible pricing) now show their limit.** These accounts have no rate-limit windows at all — their admin-set monthly credit allowance is the only limit they have, and CodeBurn was rendering an empty quota card. The desktop app and the menubar now read it from `spend_control.individual_limit` and show a "Monthly usage limit" bar with used/allowance counts, reset date, and pace projection, matching ChatGPT's own Settings → Usage panel. The menubar percentage and Codex tab badge are populated from it when no rate windows exist.
+
 ### Fixed
 - Claude Desktop and Cowork sessions are discovered for Windows Microsoft Store (MSIX) installs. (#611)
+- Codex credit balances on credit-settled accounts are no longer labeled with a dollar sign; they are denominated in credits, not USD.
+- Credit-based-pricing plan tiers (`enterprise_cbp_usage_based`, `self_serve_business_usage_based`) normalize to their base tier instead of rendering as a mangled title-cased string.
+
+### Performance
+- One fewer request per Codex quota refresh: reset-credit inventory is read from the inline `rate_limit_reset_credits` block on the usage payload, falling back to the dedicated endpoint only when it is absent.
 
 ## 0.9.19 - 2026-07-20
 

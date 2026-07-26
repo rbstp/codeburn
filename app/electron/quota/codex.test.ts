@@ -38,6 +38,100 @@ describe('Codex quota', () => {
     expect(quota.details).toHaveLength(1)
   })
 
+  // Shape captured from a live ChatGPT Enterprise workspace: no rate windows at
+  // all, the real limit living in spend_control, and numbers arriving as
+  // strings next to numbers.
+  const enterpriseBody = {
+    plan_type: 'business',
+    rate_limit: null,
+    additional_rate_limits: null,
+    credits: { has_credits: false, unlimited: false, balance: null },
+    spend_control: {
+      reached: false,
+      individual_limit: {
+        source: 'workspace_spend_controls',
+        limit: '10000',
+        used: '3028.9909675121307',
+        remaining: '6971.009032487869',
+        used_percent: 30,
+        remaining_percent: 70,
+        reset_after_seconds: 441_896,
+        reset_at: 1_785_542_400,
+      },
+    },
+    rate_limit_reset_credits: { available_count: 0 },
+  }
+
+  it('surfaces the spend-control credit limit when there are no rate windows', () => {
+    const quota = decodeCodexUsage(enterpriseBody)
+    expect(quota.primary).toEqual({
+      label: 'Monthly usage limit · 3,029 / 10,000 credits',
+      percent: 0.3,
+      resetsAt: new Date(1_785_542_400 * 1000).toISOString(),
+    })
+    expect(quota.details).toEqual([quota.primary])
+    // OpenAI reports Enterprise workspaces as "business" here; we show what it
+    // sends rather than inventing a tier.
+    expect(quota.planLabel).toBe('Business')
+    expect(quota.footerLines).toEqual([])
+  })
+
+  it('keeps rate windows primary and appends the credit limit alongside them', () => {
+    const quota = decodeCodexUsage({
+      ...enterpriseBody,
+      rate_limit: { primary_window: { used_percent: 20, reset_at: 1_800_000_000, limit_window_seconds: 18_000 } },
+    })
+    expect(quota.primary?.label).toBe('5-hour')
+    expect(quota.details.map(row => row.label)).toEqual([
+      '5-hour',
+      'Monthly usage limit · 3,029 / 10,000 credits',
+    ])
+  })
+
+  it.each([
+    ['top level', (limit: unknown) => ({ individual_limit: limit })],
+    ['camelCase key', (limit: unknown) => ({ spend_control: { individualLimit: limit } })],
+    ['nested in rate_limit', (limit: unknown) => ({ rate_limit: { individual_limit: limit } })],
+  ])('reads the credit limit positioned at %s', (_name, wrap) => {
+    const quota = decodeCodexUsage(wrap({ limit: 10_000, used: 2500, used_percent: 25 }))
+    expect(quota.primary?.percent).toBe(0.25)
+    expect(quota.primary?.label).toBe('Monthly usage limit · 2,500 / 10,000 credits')
+  })
+
+  it('derives the percent from remaining_percent, then from used/limit', () => {
+    const fromRemaining = decodeCodexUsage({ spend_control: { individual_limit: { limit: 10_000, remaining_percent: 70 } } })
+    expect(fromRemaining.primary?.percent).toBeCloseTo(0.3)
+    // Counts are back-derived from the percent when `used` is missing.
+    expect(fromRemaining.primary?.label).toBe('Monthly usage limit · 3,000 / 10,000 credits')
+
+    const fromRatio = decodeCodexUsage({ spend_control: { individual_limit: { limit: 400, used: 100 } } })
+    expect(fromRatio.primary?.percent).toBeCloseTo(0.25)
+  })
+
+  it('ignores a spend control with no usable limit', () => {
+    for (const individual_limit of [{ limit: 0, used: 5 }, { limit: null }, { used_percent: 40 }, null]) {
+      const quota = decodeCodexUsage({ spend_control: { individual_limit } })
+      expect(quota.primary).toBeNull()
+      expect(quota.details).toEqual([])
+    }
+  })
+
+  it('normalizes credit-based-pricing plan tiers', () => {
+    const label = (plan_type: string) => decodeCodexUsage({ plan_type }).planLabel
+    expect(label('enterprise_cbp_usage_based')).toBe('Enterprise')
+    expect(label('self_serve_business_usage_based')).toBe('Business')
+    expect(label('enterprise')).toBe('Enterprise')
+    // Unrecognized tiers still title-case rather than disappearing.
+    expect(label('some_future_tier')).toBe('Some Future Tier')
+  })
+
+  it('labels a credit-settled balance in credits, not dollars', () => {
+    const inCredits = decodeCodexUsage({ credits: { has_credits: true, balance: 3410.4 } })
+    expect(inCredits.footerLines).toEqual(['Credits remaining · 3,410'])
+    const inDollars = decodeCodexUsage({ credits: { has_credits: false, balance: 3.5 } })
+    expect(inDollars.footerLines).toEqual(['Credits remaining · $3.50'])
+  })
+
   it('returns disconnected without credentials', async () => {
     const fetchMock = vi.fn()
     const result = await fetchCodexQuota({ fetch: fetchMock, readFile: vi.fn(async () => null) })

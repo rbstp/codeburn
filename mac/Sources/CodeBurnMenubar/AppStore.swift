@@ -1378,17 +1378,35 @@ final class AppStore {
                     details.append(.init(label: "\(extra.name) · \(s.windowLabel)", percent: s.usedPercent / 100, resetsAt: s.resetsAt))
                 }
             }
+            // Credit-metered workspaces (Business / Edu / Enterprise on flexible
+            // pricing) report no rate windows at all — the admin-set monthly
+            // credit allowance is their only limit. Promote it to primary when
+            // there is nothing else, so the menubar bar and the tab badge have
+            // a data source instead of rendering as an empty track.
+            if let credits = usage.creditLimit {
+                let row = QuotaSummary.Window(
+                    label: "Monthly usage limit",
+                    percent: credits.usedPercent / 100,
+                    resetsAt: credits.resetsAt
+                )
+                if primary == nil { primary = row }
+                details.append(row)
+            }
         }
         let plan = codexUsage?.plan.displayName
         var footerLines: [String] = []
         if let balance = codexUsage?.creditsBalance, balance > 0 {
-            // Format as plain dollars; ChatGPT settles in USD regardless of
-            // the user's display-currency preference.
+            // Credit-metered accounts settle in credits, not dollars — rendering
+            // this balance with a currency symbol misstates it. Everyone else
+            // gets plain dollars; ChatGPT settles in USD regardless of the
+            // user's display-currency preference.
+            let inCredits = codexUsage?.hasCredits == true
             let formatter = NumberFormatter()
-            formatter.numberStyle = .currency
-            formatter.currencyCode = "USD"
-            formatter.maximumFractionDigits = 2
-            let formatted = formatter.string(from: NSNumber(value: balance)) ?? "$\(balance)"
+            formatter.numberStyle = inCredits ? .decimal : .currency
+            formatter.maximumFractionDigits = inCredits ? 0 : 2
+            if !inCredits { formatter.currencyCode = "USD" }
+            let fallback = inCredits ? "\(Int(balance.rounded()))" : "$\(balance)"
+            let formatted = formatter.string(from: NSNumber(value: balance)) ?? fallback
             footerLines.append("Credits remaining · \(formatted)")
         }
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: plan, footerLines: footerLines)

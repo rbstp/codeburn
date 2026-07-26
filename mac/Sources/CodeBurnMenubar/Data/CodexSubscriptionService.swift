@@ -111,10 +111,15 @@ enum CodexSubscriptionService {
         switch http.statusCode {
         case 200:
             clearUsageBlock()
-            // Companion fetch, strictly best-effort: any failure yields nil and
-            // the Plan view simply omits the row. This endpoint must never be
-            // able to break the quota display.
-            let resetCredits = await fetchResetCredits(token: token)
+            // The usage payload normally carries the reset-credit inventory
+            // inline, so only pay for the companion request when it doesn't.
+            // Strictly best-effort either way: any failure yields nil and the
+            // Plan view simply omits the row. Neither path may break the quota
+            // display.
+            var resetCredits = inlineResetCredits(data: data)
+            if resetCredits == nil {
+                resetCredits = await fetchResetCredits(token: token)
+            }
             do {
                 return try decodeUsage(data: data, resetCredits: resetCredits)
             } catch {
@@ -144,15 +149,77 @@ enum CodexSubscriptionService {
         }
     }
 
+    /// chatgpt.com is inconsistent about how it encodes numbers across this one
+    /// payload — `credits.balance` arrives as a Double or a String, and
+    /// `spend_control.individual_limit` mixes strings ("limit": "10000") with
+    /// numbers ("used_percent": 30) side by side. Every numeric field goes
+    /// through here so a shape flip on any one of them can't fail the fetch.
+    private enum Flexible {
+        // `decode` rather than `decodeIfPresent`: a missing key, an explicit
+        // null and a wrong-typed value should all mean "not available here",
+        // and `try?` collapses the three into one nil without the
+        // double-optional footgun `decodeIfPresent` introduces.
+        static func double<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> Double? {
+            if let v = try? c.decode(Double.self, forKey: key) { return v }
+            if let v = try? c.decode(Int.self, forKey: key) { return Double(v) }
+            if let v = try? c.decode(String.self, forKey: key) {
+                return Double(v.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            return nil
+        }
+        static func int<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> Int? {
+            double(c, key).map(Int.init)
+        }
+        static func bool<K: CodingKey>(_ c: KeyedDecodingContainer<K>, _ key: K) -> Bool {
+            (try? c.decode(Bool.self, forKey: key)) ?? false
+        }
+    }
+
     private struct UsageDTO: Decodable {
         let plan_type: String?
         let rate_limit: RateLimit?
         let additional_rate_limits: [AdditionalLimitDTO]?
         let credits: Credits?
+        let spend_control: SpendControl?
+        /// Forward-compat: some payload variants hoist the spend control to the
+        /// top level instead of nesting it under `spend_control`.
+        let individual_limit: IndividualLimit?
+
+        enum CodingKeys: String, CodingKey {
+            case plan_type, rate_limit, additional_rate_limits, credits, spend_control
+            case individual_limit
+            case individualLimit
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            plan_type = try? c.decode(String.self, forKey: .plan_type)
+            rate_limit = try? c.decode(RateLimit.self, forKey: .rate_limit)
+            additional_rate_limits = try? c.decode([AdditionalLimitDTO].self, forKey: .additional_rate_limits)
+            credits = try? c.decode(Credits.self, forKey: .credits)
+            spend_control = try? c.decode(SpendControl.self, forKey: .spend_control)
+            individual_limit = (try? c.decode(IndividualLimit.self, forKey: .individual_limit))
+                ?? (try? c.decode(IndividualLimit.self, forKey: .individualLimit))
+        }
 
         struct RateLimit: Decodable {
             let primary_window: WindowDTO?
             let secondary_window: WindowDTO?
+            /// Forward-compat: another observed position for the spend control.
+            let individual_limit: IndividualLimit?
+
+            enum CodingKeys: String, CodingKey {
+                case primary_window, secondary_window, individual_limit
+                case individualLimit
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                primary_window = try? c.decode(WindowDTO.self, forKey: .primary_window)
+                secondary_window = try? c.decode(WindowDTO.self, forKey: .secondary_window)
+                individual_limit = (try? c.decode(IndividualLimit.self, forKey: .individual_limit))
+                    ?? (try? c.decode(IndividualLimit.self, forKey: .individualLimit))
+            }
         }
         struct AdditionalLimitDTO: Decodable {
             let limit_name: String?
@@ -163,22 +230,75 @@ enum CodexSubscriptionService {
             let reset_at: Int?
             let limit_window_seconds: Int?
         }
+        /// Credit-metered workspaces (ChatGPT Business / Edu / Enterprise on
+        /// flexible pricing) report `rate_limit: null` and carry their real
+        /// limit here instead — the monthly credit allowance an admin sets.
+        struct SpendControl: Decodable {
+            let reached: Bool
+            let individualLimit: IndividualLimit?
+
+            enum CodingKeys: String, CodingKey {
+                case reached
+                case individual_limit
+                case individualLimit
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                reached = Flexible.bool(c, .reached)
+                individualLimit = (try? c.decode(IndividualLimit.self, forKey: .individual_limit))
+                    ?? (try? c.decode(IndividualLimit.self, forKey: .individualLimit))
+            }
+        }
+        struct IndividualLimit: Decodable {
+            let limit: Double?
+            let used: Double?
+            let usedPercent: Double?
+            let remainingPercent: Double?
+            let resetAt: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case limit, used
+                case used_percent, usedPercent
+                case remaining_percent, remainingPercent
+                case reset_at, resets_at, resetsAt
+            }
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                limit = Flexible.double(c, .limit)
+                used = Flexible.double(c, .used)
+                usedPercent = Flexible.double(c, .used_percent) ?? Flexible.double(c, .usedPercent)
+                remainingPercent = Flexible.double(c, .remaining_percent)
+                    ?? Flexible.double(c, .remainingPercent)
+                resetAt = Flexible.int(c, .reset_at)
+                    ?? Flexible.int(c, .resets_at)
+                    ?? Flexible.int(c, .resetsAt)
+            }
+        }
         // chatgpt.com sometimes serializes balance as a Double ("balance": 0.0)
         // and other times as a String ("balance": "0.00"). Mirror CodexBar's
         // resilient decode so a schema drift on either shape doesn't blow up
         // the whole quota fetch.
         struct Credits: Decodable {
             let balance: Double?
-            enum CodingKeys: String, CodingKey { case balance }
+            /// The account settles in credits rather than dollars, which changes
+            /// how `balance` must be labelled.
+            let hasCredits: Bool
+            /// Credit-metered but deliberately uncapped.
+            let unlimited: Bool
+
+            enum CodingKeys: String, CodingKey {
+                case balance
+                case has_credits
+                case unlimited
+            }
+
             init(from decoder: Decoder) throws {
                 let c = try decoder.container(keyedBy: CodingKeys.self)
-                if let n = try? c.decode(Double.self, forKey: .balance) {
-                    balance = n
-                } else if let s = try? c.decode(String.self, forKey: .balance), let n = Double(s) {
-                    balance = n
-                } else {
-                    balance = nil
-                }
+                balance = Flexible.double(c, .balance)
+                hasCredits = Flexible.bool(c, .has_credits)
+                unlimited = Flexible.bool(c, .unlimited)
             }
         }
     }
@@ -202,6 +322,22 @@ enum CodexSubscriptionService {
             return nil
         }
         return parseResetCredits(data: data)
+    }
+
+    /// Reset-credit inventory carried inline on the usage payload. Unlike the
+    /// dedicated endpoint this form has no per-credit expiry list, so the
+    /// popover shows the count without a "next expires" caption. Returns nil
+    /// when the block is absent, which is the signal to fall back to
+    /// `fetchResetCredits`. Internal so tests can drive it with fixtures.
+    static func inlineResetCredits(data: Data) -> CodexUsage.ResetCredits? {
+        struct InlineDTO: Decodable {
+            struct Block: Decodable { let available_count: Int? }
+            let rate_limit_reset_credits: Block?
+        }
+        guard let count = (try? JSONDecoder().decode(InlineDTO.self, from: data))?
+            .rate_limit_reset_credits?.available_count, count >= 0
+        else { return nil }
+        return CodexUsage.ResetCredits(availableCount: count, nextExpiresAt: nil)
     }
 
     /// Internal (not private) so tests can drive it with fixture payloads.
@@ -239,7 +375,8 @@ enum CodexSubscriptionService {
         return plain.date(from: raw)
     }
 
-    private static func decodeUsage(data: Data, resetCredits: CodexUsage.ResetCredits? = nil) throws -> CodexUsage {
+    /// Internal (not private) so tests can drive it with fixture payloads.
+    static func decodeUsage(data: Data, resetCredits: CodexUsage.ResetCredits? = nil) throws -> CodexUsage {
         let root = try JSONDecoder().decode(UsageDTO.self, from: data)
         let additional: [CodexUsage.AdditionalLimit] = (root.additional_rate_limits ?? []).compactMap { dto in
             guard let name = dto.limit_name, !name.isEmpty else { return nil }
@@ -249,15 +386,58 @@ enum CodexSubscriptionService {
                 secondary: makeWindow(dto.rate_limit?.secondary_window)
             )
         }
+        // `spend_control` is the position the live API uses; the other two are
+        // forward-compat fallbacks for variants seen in other clients.
+        let limitDTO = root.spend_control?.individualLimit
+            ?? root.individual_limit
+            ?? root.rate_limit?.individual_limit
         return CodexUsage(
             plan: CodexUsage.planType(from: root.plan_type),
             primary: makeWindow(root.rate_limit?.primary_window),
             secondary: makeWindow(root.rate_limit?.secondary_window),
             additionalLimits: additional,
             creditsBalance: root.credits?.balance,
+            hasCredits: root.credits?.hasCredits ?? false,
+            creditsUnlimited: root.credits?.unlimited ?? false,
+            creditLimit: makeCreditLimit(limitDTO, reached: root.spend_control?.reached ?? false),
             resetCredits: resetCredits,
             fetchedAt: Date()
         )
+    }
+
+    private static func makeCreditLimit(
+        _ dto: UsageDTO.IndividualLimit?,
+        reached: Bool
+    ) -> CodexUsage.CreditLimit? {
+        guard let dto, let limit = dto.limit, limit > 0 else { return nil }
+        // Prefer the server's own percentage, then remaining_percent, then the
+        // raw ratio — a partial payload should still render a bar.
+        let raw = dto.usedPercent
+            ?? dto.remainingPercent.map { 100 - $0 }
+            ?? dto.used.map { $0 / limit * 100 }
+            ?? 0
+        let percent = min(max(raw, 0), 100)
+        let resetsAt = dto.resetAt.flatMap { $0 > 0 ? Date(timeIntervalSince1970: TimeInterval($0)) : nil }
+        return CodexUsage.CreditLimit(
+            used: dto.used ?? limit * percent / 100,
+            limit: limit,
+            usedPercent: percent,
+            resetsAt: resetsAt,
+            windowSeconds: monthlyWindowSeconds(endingAt: resetsAt),
+            reached: reached
+        )
+    }
+
+    /// Spend controls reset on a calendar-month boundary, so the window length
+    /// is the month preceding the reset — not a fixed 30 days, and not the
+    /// payload's `reset_after_seconds` (which is time *remaining*). QuotaPace
+    /// needs the whole-window duration to extrapolate honestly.
+    private static func monthlyWindowSeconds(endingAt resetsAt: Date?) -> Int? {
+        guard let resetsAt,
+              let start = Calendar.current.date(byAdding: .month, value: -1, to: resetsAt)
+        else { return nil }
+        let seconds = Int(resetsAt.timeIntervalSince(start))
+        return seconds > 0 ? seconds : nil
     }
 
     private static func makeWindow(_ dto: UsageDTO.WindowDTO?) -> CodexUsage.Window? {

@@ -133,10 +133,30 @@ function windowOf(value: unknown, override?: string): QuotaWindow | null {
   return { label: override ?? labelForSeconds(row.limit_window_seconds), percent, resetsAt: reset }
 }
 
+/// chatgpt.com is inconsistent about number encoding inside a single payload —
+/// `spend_control.individual_limit` ships `"limit": "10000"` (string) next to
+/// `"used_percent": 30` (number). Accept either shape everywhere.
+function num(value: unknown): number | null {
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : NaN
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+/// Credit-based-pricing workspaces report composite tiers such as
+/// `enterprise_cbp_usage_based` or `self_serve_business_usage_based`. Strip the
+/// billing-mode decorations so they land on the tier they actually are;
+/// anything unrecognized passes through to the title-case fallback untouched.
+function normalizePlanType(value: string): string {
+  return value
+    .replace(/[_-]usage[_-]based$/, '')
+    .replace(/^self[_-]serve[_-]/, '')
+    .replace(/[_-]cbp$/, '')
+    .replace(/[_-]cbp[_-]/, '_')
+}
+
 function planLabel(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) return null
   const raw = value.trim()
-  const lower = raw.toLowerCase()
+  const lower = normalizePlanType(raw.toLowerCase())
   const known: Record<string, string> = {
     guest: 'Guest', free: 'Free', go: 'Go', plus: 'Plus', pro: 'Pro',
     prolite: 'Pro Lite', pro_lite: 'Pro Lite', 'pro-lite': 'Pro Lite',
@@ -144,6 +164,37 @@ function planLabel(value: unknown): string | null {
     education: 'Education', quorum: 'Quorum', k12: 'K-12', enterprise: 'Enterprise', edu: 'Edu',
   }
   return known[lower] ?? lower.replace(/(^|[_-])\w/g, match => match.replace(/[_-]/, ' ').toUpperCase())
+}
+
+/// The admin-set monthly credit allowance on a credit-metered workspace
+/// (ChatGPT Business / Edu / Enterprise on flexible pricing). Those accounts
+/// report `rate_limit: null` — this is the only limit they have, so without it
+/// the quota card renders empty. `spend_control` is the position the live API
+/// uses; the other two are forward-compat fallbacks seen in other clients.
+/// Percent is reported directly by the server; fall back through
+/// `remaining_percent` and the raw ratio so a partial payload still renders.
+function spendControlWindow(data: Record<string, any>): QuotaWindow | null {
+  const row = data.spend_control?.individual_limit
+    ?? data.spend_control?.individualLimit
+    ?? data.individual_limit
+    ?? data.individualLimit
+    ?? data.rate_limit?.individual_limit
+    ?? data.rate_limit?.individualLimit
+  if (!row || typeof row !== 'object') return null
+  const limit = num(row.limit)
+  if (limit === null || limit <= 0) return null
+  const remainingPercent = num(row.remaining_percent ?? row.remainingPercent)
+  const used = num(row.used)
+  const rawPercent = num(row.used_percent ?? row.usedPercent)
+    ?? (remainingPercent === null ? null : 100 - remainingPercent)
+    ?? (used === null ? null : (used / limit) * 100)
+  if (rawPercent === null) return null
+  const percent = Math.min(1, Math.max(0, rawPercent / 100))
+  const resetRaw = num(row.reset_at ?? row.resets_at ?? row.resetsAt)
+  const resetsAt = resetRaw !== null && resetRaw > 0 ? new Date(resetRaw * 1000).toISOString() : null
+  const spent = used ?? limit * percent
+  const round = (n: number) => Math.round(n).toLocaleString('en-US')
+  return { label: `Monthly usage limit · ${round(spent)} / ${round(limit)} credits`, percent, resetsAt }
 }
 
 export function decodeCodexUsage(body: unknown): QuotaProvider {
@@ -165,12 +216,20 @@ export function decodeCodexUsage(body: unknown): QuotaProvider {
       }
     }
   }
-  const rawBalance = data.credits?.balance
-  const balance = typeof rawBalance === 'number' ? rawBalance : typeof rawBalance === 'string' ? Number(rawBalance) : NaN
+  // Promote the credit allowance to primary when there are no rate windows, so
+  // the quota card has a bar instead of rendering as an empty track.
+  const credits = spendControlWindow(data)
+  if (credits) details.push(credits)
+  const balance = num(data.credits?.balance)
+  // Credit-metered accounts settle in credits, not dollars — rendering this
+  // balance with a currency symbol misstates it.
+  const hasCredits = data.credits?.has_credits === true
   return {
-    provider: 'codex', connection: 'connected', primary, details,
+    provider: 'codex', connection: 'connected', primary: primary ?? credits, details,
     planLabel: planLabel(data.plan_type),
-    footerLines: Number.isFinite(balance) && balance > 0 ? [`Credits remaining · $${balance.toFixed(2)}`] : [],
+    footerLines: balance !== null && balance > 0
+      ? [`Credits remaining · ${hasCredits ? Math.round(balance).toLocaleString('en-US') : `$${balance.toFixed(2)}`}`]
+      : [],
   }
 }
 

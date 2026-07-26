@@ -76,16 +76,43 @@ struct CodexUsage: Sendable, Equatable {
         let nextExpiresAt: Date?
     }
 
+    /// The monthly credit allowance an admin sets on a credit-metered workspace
+    /// (ChatGPT Business / Edu / Enterprise on flexible pricing). These accounts
+    /// report `rate_limit: null` — the spend control *is* their only limit, so
+    /// without this the popover has nothing to draw. Mirrors what ChatGPT's own
+    /// Settings → Usage panel shows: "3,029 of 10,000 credits used".
+    struct CreditLimit: Sendable, Equatable {
+        let used: Double
+        let limit: Double
+        let usedPercent: Double        // 0.0 ... 100.0
+        let resetsAt: Date?
+        /// Whole-window length for pace projection: the calendar month the
+        /// allowance resets on. Deliberately *not* the payload's
+        /// `reset_after_seconds`, which is the time remaining.
+        let windowSeconds: Int?
+        /// The workspace has already spent the allowance — a hard stop, not a
+        /// near-limit warning.
+        let reached: Bool
+    }
+
     let plan: PlanType
     let primary: Window?
     let secondary: Window?
     let additionalLimits: [AdditionalLimit]
     let creditsBalance: Double?
+    /// True when the account settles in *credits* rather than dollars, which
+    /// changes how `creditsBalance` must be formatted.
+    let hasCredits: Bool
+    /// Credit-metered but deliberately uncapped. Distinguishes "no limit shown
+    /// because there is none" from "no limit shown because we failed to read it".
+    let creditsUnlimited: Bool
+    let creditLimit: CreditLimit?
     let resetCredits: ResetCredits?
     let fetchedAt: Date
 
     static func planType(from raw: String?) -> PlanType {
-        guard let raw = raw?.lowercased() else { return .unknown("") }
+        guard let original = raw?.lowercased() else { return .unknown("") }
+        let raw = normalizePlanType(original)
         switch raw {
         case "guest": return .guest
         case "free": return .free
@@ -101,7 +128,24 @@ struct CodexUsage: Sendable, Equatable {
         case "k12": return .k12
         case "enterprise": return .enterprise
         case "edu": return .edu
-        default: return .unknown(raw)
+        // Preserve the *original* string so an unrecognized tier still shows
+        // exactly what OpenAI sent rather than our stripped-down guess.
+        default: return .unknown(original)
         }
+    }
+
+    /// Credit-based-pricing workspaces report composite tiers such as
+    /// `enterprise_cbp_usage_based` or `self_serve_business_usage_based`. Strip
+    /// the billing-mode decorations so they land on the tier they actually are;
+    /// anything we don't recognize passes through untouched.
+    private static func normalizePlanType(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for suffix in ["_usage_based", "-usage-based"] where value.hasSuffix(suffix) {
+            value.removeLast(suffix.count)
+        }
+        if value.hasPrefix("self_serve_") { value.removeFirst("self_serve_".count) }
+        if value.hasSuffix("_cbp") { value.removeLast("_cbp".count) }
+        value = value.replacingOccurrences(of: "_cbp_", with: "_")
+        return value
     }
 }

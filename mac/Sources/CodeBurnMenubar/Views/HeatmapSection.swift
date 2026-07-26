@@ -2067,7 +2067,7 @@ private struct CodexPlanInsight: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer()
-                if let resetsAt = (usage.primary ?? usage.secondary)?.resetsAt {
+                if let resetsAt = (usage.primary ?? usage.secondary)?.resetsAt ?? usage.creditLimit?.resetsAt {
                     Text("Resets \(relativeReset(resetsAt))")
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
@@ -2109,6 +2109,33 @@ private struct CodexPlanInsight: View {
                     )
                 }
             }
+            // Credit-metered workspaces (Business / Edu / Enterprise on flexible
+            // pricing) report no rate windows at all — their admin-set monthly
+            // credit allowance is the only limit they have, so without this row
+            // the whole card renders empty. Mirrors ChatGPT's own
+            // Settings → Usage panel, except we show used% rather than
+            // remaining% so the bar reads the same direction as every other one
+            // here.
+            if let credits = usage.creditLimit {
+                UtilizationRow(
+                    label: creditLimitLabel(credits),
+                    percent: credits.usedPercent,
+                    resetsAt: credits.resetsAt,
+                    projection: pace(for: credits)
+                )
+            } else if usage.creditsUnlimited {
+                // Uncapped on purpose. Say so, rather than leaving a blank card
+                // that reads as a failed fetch.
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Credits")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Unlimited")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
             // Limit-reset credits the account is holding. Hidden at zero so
             // plans that never receive these grants see no extra row.
             if let resets = usage.resetCredits, resets.availableCount > 0 {
@@ -2145,6 +2172,39 @@ private struct CodexPlanInsight: View {
             deltaPercent: result.deltaPercent,
             compact: TimeInterval(window.limitWindowSeconds) <= QuotaPace.etaSuppressionMaxSeconds
         )
+    }
+
+    /// Same pace math as the rate windows, driven by the calendar-month window
+    /// the spend control resets on. Nil when we couldn't derive that window.
+    private func pace(for credits: CodexUsage.CreditLimit) -> WindowProjection? {
+        guard let windowSeconds = credits.windowSeconds,
+              let result = QuotaPace.evaluate(
+                  usedPercent: credits.usedPercent,
+                  resetsAt: credits.resetsAt,
+                  windowSeconds: windowSeconds
+              )
+        else { return nil }
+        return WindowProjection(
+            percent: result.projectedPercent,
+            willOverflow: result.willOverflow,
+            hitsLimitAt: result.hitsLimitAt,
+            source: .linear,
+            deltaPercent: result.deltaPercent,
+            compact: TimeInterval(windowSeconds) <= QuotaPace.etaSuppressionMaxSeconds
+        )
+    }
+
+    /// "Monthly usage limit · 3,029 / 10,000 credits". UtilizationRow has no
+    /// subtitle slot, so the counts ride along in the label.
+    private func creditLimitLabel(_ credits: CodexUsage.CreditLimit) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 0
+        let used = formatter.string(from: NSNumber(value: credits.used)) ?? "\(Int(credits.used))"
+        let limit = formatter.string(from: NSNumber(value: credits.limit)) ?? "\(Int(credits.limit))"
+        let base = "Monthly usage limit · \(used) / \(limit) credits"
+        // Spent out: a hard stop, not a near-limit warning.
+        return credits.reached ? "\(base) · limit reached" : base
     }
 
     private func resetCreditsLabel(_ resets: CodexUsage.ResetCredits) -> String {
